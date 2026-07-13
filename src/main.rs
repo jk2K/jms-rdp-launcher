@@ -8,8 +8,6 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, LauncherError>;
-const DEFAULT_RDP_PROFILE: &str = "mac";
-const TEMPLATE_RDP_FILE_NAME: &str = "mstsc-success-template.rdp";
 
 #[derive(Debug)]
 enum LauncherError {
@@ -39,12 +37,10 @@ struct Cli {
     write_only: bool,
     register: bool,
     unregister: bool,
+    register_self: bool,
     mstsc: Option<PathBuf>,
-    profile: Option<String>,
     log: Option<PathBuf>,
     rdp_file: Option<PathBuf>,
-    set_template: Option<PathBuf>,
-    clear_template: bool,
     no_wait: bool,
     direct_mstsc: bool,
     use_cmdkey: bool,
@@ -61,9 +57,12 @@ struct RdpLaunch {
     /// authenticates the native RDP login with username `user|token_id` and this
     /// value as the password; it is never written into the `.rdp` file.
     password: Option<String>,
+    original_content: String,
     inner_config_base64: bool,
     config_strategy: &'static str,
-    compat_patches: Vec<String>,
+    /// Debug aid: top-level JSON keys + shape of any `token`/`value` field
+    /// (keys only / truncated values, never the raw secret).
+    payload_summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,8 +75,75 @@ enum JsonValue {
     Object(BTreeMap<String, JsonValue>),
 }
 
+/// Self-registration helper for the macOS `.app`. Used by `--register-self`
+/// (invoked when the bundle is opened directly) so the user never has to touch
+/// `lsregister` or the LaunchServices plist: dragging the app to /Applications
+/// and opening it once makes it the `jms://` handler.
+#[cfg(target_os = "macos")]
+mod macos_handler {
+    use std::ffi::{c_char, c_void};
+    use std::path::Path;
+
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "CoreServices", kind = "framework")]
+    extern "C" {
+        fn LSSetDefaultHandlerForURLScheme(scheme: *const c_void, handler: *const c_void) -> i32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithCString(
+            allocator: *const c_void,
+            value: *const c_char,
+            encoding: u32,
+        ) -> *const c_void;
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: *const c_void,
+            buffer: *const u8,
+            len: isize,
+            is_directory: u8,
+        ) -> *const c_void;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    /// Make the `.app` at `bundle_path` the system default handler for `jms://`.
+    pub fn set_default_jms_handler(bundle_path: &Path) {
+        let Some(bytes) = bundle_path.to_str().map(str::as_bytes) else {
+            return;
+        };
+        let scheme = std::ffi::CString::new("jms").unwrap();
+        unsafe {
+            let scheme_ref = CFStringCreateWithCString(
+                std::ptr::null(),
+                scheme.as_ptr(),
+                K_CF_STRING_ENCODING_UTF8,
+            );
+            // `.app` bundles are directories.
+            let url = CFURLCreateFromFileSystemRepresentation(
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as isize,
+                1,
+            );
+            if !scheme_ref.is_null() && !url.is_null() {
+                LSSetDefaultHandlerForURLScheme(scheme_ref, url);
+            }
+            if !scheme_ref.is_null() {
+                CFRelease(scheme_ref);
+            }
+            if !url.is_null() {
+                CFRelease(url);
+            }
+        }
+    }
+}
+
+
 fn main() {
-    let cli = match parse_cli(env::args().skip(1).collect()) {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    let cli = match parse_cli(args) {
         Ok(cli) => cli,
         Err(err) => {
             eprintln!("Error: {err}");
@@ -103,12 +169,7 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
     append_log(log_path, "starting jms-rdp-launcher")?;
 
     if cli.register {
-        register_protocol(
-            log_path,
-            cli.profile.as_deref(),
-            cli.direct_mstsc,
-            cli.use_cmdkey,
-        )?;
+        register_protocol(log_path, cli.direct_mstsc, cli.use_cmdkey)?;
         return Ok(());
     }
 
@@ -117,13 +178,8 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(template_path) = cli.set_template {
-        install_template_rdp(&template_path, log_path)?;
-        return Ok(());
-    }
-
-    if cli.clear_template {
-        clear_template_rdp(log_path)?;
+    if cli.register_self {
+        register_self_handler(log_path)?;
         return Ok(());
     }
 
@@ -149,13 +205,16 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
     let input = cli
         .input
         .ok_or_else(|| LauncherError::Message("missing jms:// input".to_string()))?;
+    // Dump the full, untruncated jms:// payload to a file so it can be replayed
+    // (e.g. through the official Swift handler) for A/B diagnosis. The payload
+    // may carry a token secret; the file lives in the per-user config dir.
+    let _ = fs::write(app_config_dir().join("last_jms_url.txt"), &input);
     append_log(
         log_path,
         &format!("raw argument: {}", redact_long(&input, 300)),
     )?;
 
-    let profile = cli.profile.as_deref().unwrap_or(DEFAULT_RDP_PROFILE);
-    let launch = parse_jms_link(&input, profile)?;
+    let launch = parse_jms_link(&input)?;
     append_log(
         log_path,
         &format!(
@@ -168,14 +227,9 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
     append_log(
         log_path,
         &format!(
-            "rdp content: inner_config_base64={}, config_strategy={}, compat_patches={}, preview={}",
+            "rdp content: inner_config_base64={}, config_strategy={}, preview={}",
             launch.inner_config_base64,
             launch.config_strategy,
-            if launch.compat_patches.is_empty() {
-                "none".to_string()
-            } else {
-                launch.compat_patches.join(", ")
-            },
             rdp_preview(&launch.content)
         ),
     )?;
@@ -183,6 +237,11 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
         log_path,
         "rdp file content redacted",
         &redact_rdp_content(&launch.content),
+    )?;
+    append_multiline_log(
+        log_path,
+        "ORIGINAL jumpserver rdp content redacted (before single-profile regeneration)",
+        &redact_rdp_content(&launch.original_content),
     )?;
     append_log(
         log_path,
@@ -195,6 +254,7 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
             }
         ),
     )?;
+    append_log(log_path, &format!("payload summary: {}", launch.payload_summary))?;
 
     if launch.protocol != "rdp" {
         return Err(LauncherError::Message(format!(
@@ -208,14 +268,6 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
         println!("name: {}", launch.name);
         println!("inner_config_base64: {}", launch.inner_config_base64);
         println!("config_strategy: {}", launch.config_strategy);
-        println!(
-            "compat_patches: {}",
-            if launch.compat_patches.is_empty() {
-                "none".to_string()
-            } else {
-                launch.compat_patches.join(", ")
-            }
-        );
         println!("rdp bytes: {}", launch.content.len());
         println!("rdp preview:");
         for line in launch.content.lines().take(20) {
@@ -260,11 +312,11 @@ fn parse_cli(args: Vec<String>) -> Result<Cli> {
             "--write-only" => cli.write_only = true,
             "--register" => cli.register = true,
             "--unregister" => cli.unregister = true,
+            "--register-self" => cli.register_self = true,
             "--no-wait" => cli.no_wait = true,
             "--direct-mstsc" => cli.direct_mstsc = true,
             "--use-cmdkey" => cli.use_cmdkey = true,
             "--no-cmdkey" => cli.use_cmdkey = false,
-            "--clear-template" => cli.clear_template = true,
             "--monitor-seconds" => {
                 index += 1;
                 let value = args.get(index).ok_or_else(|| {
@@ -280,33 +332,6 @@ fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .get(index)
                     .ok_or_else(|| LauncherError::Message("--mstsc requires a path".to_string()))?;
                 cli.mstsc = Some(PathBuf::from(value));
-            }
-            "--set-template" => {
-                index += 1;
-                let value = args.get(index).ok_or_else(|| {
-                    LauncherError::Message("--set-template requires a .rdp path".to_string())
-                })?;
-                cli.set_template = Some(PathBuf::from(value));
-            }
-            "--profile" => {
-                index += 1;
-                let value = args.get(index).ok_or_else(|| {
-                    LauncherError::Message(
-                        "--profile requires mac, gnome, template, swift, legacy, or raw"
-                            .to_string(),
-                    )
-                })?;
-                let normalized = value.to_ascii_lowercase();
-                match normalized.as_str() {
-                    "mac" | "gnome" | "template" | "legacy" | "swift" | "raw" => {
-                        cli.profile = Some(normalized)
-                    }
-                    _ => {
-                        return Err(LauncherError::Message(format!(
-                            "invalid --profile value: {value}; expected mac, gnome, template, swift, legacy, or raw"
-                        )))
-                    }
-                }
             }
             "--log" => {
                 index += 1;
@@ -343,31 +368,38 @@ fn print_help() {
     println!(
         "jms-rdp-launcher\n\
          \n\
+         Parses a JumpServer jms:// link into a .rdp file and launches the native\n\
+         RDP client for the current OS:\n\
+           - macOS   -> \"Windows App\" (Microsoft Remote Desktop), via `open`\n\
+           - Windows -> mstsc.exe (via ShellExecute .rdp association by default)\n\
+         There is a single RDP profile; the launch command is chosen by platform.\n\
+         \n\
          Usage:\n\
-           jms-rdp-launcher.exe [options] \"jms://...\"\n\
-           jms-rdp-launcher.exe --register\n\
-           jms-rdp-launcher.exe --rdp-file path\\to\\file.rdp\n\
+           jms-rdp-launcher [options] \"jms://...\"\n\
+           jms-rdp-launcher --register\n\
+           jms-rdp-launcher --rdp-file path/to/file.rdp\n\
          \n\
          Options:\n\
-           --inspect            Decode and print a preview; do not launch mstsc\n\
-           --write-only         Decode and write the .rdp file; do not launch mstsc\n\
-           --mstsc <path>       Override mstsc.exe path\n\
-           --set-template <rdp> Import an MSTSC .rdp file that can connect to Ubuntu directly\n\
-           --clear-template     Remove the saved MSTSC template\n\
-           --profile <name>     RDP profile: mac, gnome, template, swift, legacy, raw (default mac)\n\
+           --inspect            Decode and print a preview; do not launch the client\n\
+           --write-only         Decode and write the .rdp file; do not launch the client\n\
+           --mstsc <path>       Override the RDP client (mstsc.exe / `open` target)\n\
            --log <path>         Override log path\n\
            --rdp-file <path>    Launch an existing .rdp file\n\
-           --no-wait            Spawn mstsc and return immediately\n\
-           --direct-mstsc       Launch mstsc.exe directly instead of ShellExecute-opening .rdp\n\
-           --use-cmdkey         Write username|token_id + token.value to Credential Manager (default)\n\
-           --no-cmdkey          Do not write temporary Windows credentials\n\
-           --monitor-seconds N  After mstsc returns, wait N seconds and query RDP events (default 30)\n\
-           --register           Register this exe as the jms:// handler for current user\n\
+           --no-wait            Spawn the client and return immediately\n\
+           --direct-mstsc       Windows only: launch mstsc.exe directly instead of ShellExecute .rdp\n\
+           --use-cmdkey         Windows only: write user|token_id + token.value to Credential\n\
+                                Manager (default). On macOS the token is copied to the clipboard\n\
+                                so you can paste it into the credential prompt.\n\
+           --no-cmdkey          Do not install temporary Windows credentials / do not copy token\n\
+           --monitor-seconds N  Windows only: after mstsc returns, wait N s and query RDP events\n\
+                                (default 30)\n\
+           --register           Register this binary as the jms:// handler for the current user\n\
+           --register-self      macOS: register the parent .app bundle as the jms:// handler\n\
            --unregister         Remove the current-user jms:// registration\n"
     );
 }
 
-fn parse_jms_link(input: &str, profile: &str) -> Result<RdpLaunch> {
+fn parse_jms_link(input: &str) -> Result<RdpLaunch> {
     let trimmed = input.trim().trim_matches('"').trim_matches('\'');
     let payload = trimmed
         .strip_prefix("jms://")
@@ -378,10 +410,10 @@ fn parse_jms_link(input: &str, profile: &str) -> Result<RdpLaunch> {
     let json_text = String::from_utf8(decoded)
         .map_err(|err| LauncherError::Message(format!("decoded payload is not UTF-8: {err}")))?;
     let json = JsonParser::new(&json_text).parse()?;
-    extract_rdp_launch(&json, profile)
+    extract_rdp_launch(&json)
 }
 
-fn extract_rdp_launch(json: &JsonValue, profile: &str) -> Result<RdpLaunch> {
+fn extract_rdp_launch(json: &JsonValue) -> Result<RdpLaunch> {
     let object = match json {
         JsonValue::Object(object) => object,
         _ => {
@@ -417,20 +449,49 @@ fn extract_rdp_launch(json: &JsonValue, profile: &str) -> Result<RdpLaunch> {
             )
         })?
         .to_string();
-    let (content, inner_config_base64) = decode_embedded_rdp_config(&raw_content)?;
-    let (content, config_strategy, compat_patches) =
-        normalize_jumpserver_rdp_config(content, profile);
+    let (decoded_content, inner_config_base64) = decode_embedded_rdp_config(&raw_content)?;
+    let original_content = decoded_content.clone();
+    let (content, config_strategy) = normalize_jumpserver_rdp_config(decoded_content);
     let password = extract_token_secret(object);
+
+    let payload_summary = summarize_payload(object);
 
     Ok(RdpLaunch {
         protocol,
         name,
         content,
+        original_content,
         password,
         inner_config_base64,
         config_strategy,
-        compat_patches,
+        payload_summary,
     })
+}
+
+/// Debug aid: describe the decoded JSON's top-level shape so we can see which
+/// fields JumpServer actually emits (e.g. whether the gateway secret travels as
+/// `token.value`). Reports keys + field shapes only, never raw secret values.
+fn summarize_payload(object: &BTreeMap<String, JsonValue>) -> String {
+    let mut parts: Vec<String> = object
+        .keys()
+        .map(|k| {
+            let shape = match object.get(k) {
+                Some(JsonValue::Object(inner)) => {
+                    let keys: Vec<&str> = inner.keys().map(|x| x.as_str()).collect();
+                    format!("object{{{}}}", keys.join(","))
+                }
+                Some(JsonValue::Array(_)) => "array".to_string(),
+                Some(JsonValue::String(s)) => format!("string(len={})", s.len()),
+                Some(JsonValue::Bool(_)) => "bool".to_string(),
+                Some(JsonValue::Number(_)) => "number".to_string(),
+                Some(JsonValue::Null) => "null".to_string(),
+                None => "?".to_string(),
+            };
+            format!("{k}={shape}")
+        })
+        .collect();
+    parts.sort();
+    format!("top-level: {}", parts.join(", "))
 }
 
 /// Pull the JumpServer connection-token secret out of the decoded payload.
@@ -461,281 +522,62 @@ fn extract_token_secret(object: &BTreeMap<String, JsonValue>) -> Option<String> 
     None
 }
 
-fn normalize_jumpserver_rdp_config(
-    content: String,
-    profile: &str,
-) -> (String, &'static str, Vec<String>) {
+/// Produce the single canonical `.rdp` body for a JumpServer token connection.
+///
+/// There is exactly one profile now. When the payload carries a JumpServer
+/// token username (`user|token_id`) we regenerate a clean, Microsoft-client
+/// (Windows "Windows App" / mstsc) friendly config built around the JumpServer
+/// gateway address and token username. We keep the gateway `full address`
+/// verbatim (port included), fix the colour depth to 32bpp, and turn on the
+/// standard CredSSP/NLA negotiation the JumpServer razor gateway expects.
+///
+/// A plain `.rdp` with no JumpServer token username is left untouched (the
+/// `--rdp-file` path can still launch arbitrary saved files).
+fn normalize_jumpserver_rdp_config(content: String) -> (String, &'static str) {
     if has_jumpserver_token_username(&content) {
-        match profile {
-            "raw" => return (content, "raw_jumpserver", Vec::new()),
-            "template" => {
-                if let Some(regenerated) = build_template_based_mstsc_rdp_config(&content) {
-                    return (regenerated, "mstsc_saved_template", Vec::new());
-                }
-                if let Some(regenerated) = build_mac_microsoft_remote_desktop_rdp_config(&content) {
-                    return (
-                        regenerated,
-                        "mac_microsoft_remote_desktop_compatible",
-                        vec!["template_not_installed".to_string()],
-                    );
-                }
-            }
-            "mac" => {
-                if let Some(regenerated) = build_mac_microsoft_remote_desktop_rdp_config(&content) {
-                    return (
-                        regenerated,
-                        "mac_microsoft_remote_desktop_compatible",
-                        Vec::new(),
-                    );
-                }
-            }
-            "gnome" => {
-                if let Some(regenerated) = build_gnome_mstsc_rdp_config(&content) {
-                    return (regenerated, "mstsc_gnome_compatible", Vec::new());
-                }
-            }
-            "swift" => {
-                if let Some(regenerated) = build_swift_compatible_mstsc_rdp_config(&content) {
-                    return (regenerated, "swift_compatible_mstsc", Vec::new());
-                }
-            }
-            "legacy" => {
-                if let Some(regenerated) = build_mstsc_legacy_graphics_rdp_config(&content) {
-                    return (regenerated, "mstsc_legacy_graphics", Vec::new());
-                }
-            }
-            _ => {}
+        if let Some(regenerated) = build_rdp_config(&content) {
+            return (regenerated, "regenerated");
         }
     }
-
-    (content, "raw", Vec::new())
+    (content, "raw")
 }
 
-fn build_gnome_mstsc_rdp_config(content: &str) -> Option<String> {
+/// The one and only RDP config generator. Extracts `full address` and
+/// `username` from whatever JumpServer emitted and emits the same minimal
+/// `.rdp` the official JumpServer macOS client (Swift) generates with its
+/// default "balanced" quality profile — because that is the config proven to
+/// connect this Windows App to the Ubuntu 24.04 GNOME Remote Desktop target.
+///
+/// Two hard-won specifics, both learned by comparing against the working Swift
+/// client:
+///
+/// 1. **`session bpp` is 24, NOT 32.** With 32bpp the Microsoft "Windows App"
+///    tries to negotiate the AVC444/H.264 graphics codec; GNOME Remote Desktop
+///    can't serve it, so `PopulateCodecCapabilities` fails and the session is
+///    dropped. 24bpp avoids that codec path and connects. (The README's old
+///    "pin 32bpp for Ubuntu 24.04" note was backwards.)
+///
+/// 2. **No `prompt for credentials on client`, `authentication level`,
+///    `enablecredsspsupport`, or gateway fields.** Those make the client skip
+///    the credential prompt (the `.rdp` carries no password → instant
+///    Disconnect Reason 2) or reject the gateway's untrusted cert. Omitting
+///    them lets the client use its defaults: prompt for the account password,
+///    accept the JumpServer gateway.
+fn build_rdp_config(content: &str) -> Option<String> {
     let full_address = rdp_setting_value(content, "full address")?;
     let username = rdp_setting_value(content, "username")?;
-
-    if full_address.trim().is_empty() || username.trim().is_empty() {
+    let full_address = full_address.trim();
+    let username = username.trim();
+    if full_address.is_empty() || username.is_empty() {
         return None;
     }
 
-    let overrides = [
-        (
-            "full address",
-            format!("full address:s:{}", full_address.trim()),
-        ),
-        ("username", format!("username:s:{}", username.trim())),
-        ("desktopwidth", "desktopwidth:i:1920".to_string()),
-        ("desktopheight", "desktopheight:i:1080".to_string()),
-        ("screen mode id", "screen mode id:i:1".to_string()),
-        ("session bpp", "session bpp:i:32".to_string()),
-        ("compression", "compression:i:1".to_string()),
-        ("networkautodetect", "networkautodetect:i:1".to_string()),
-        ("bandwidthautodetect", "bandwidthautodetect:i:1".to_string()),
-        ("smart sizing", "smart sizing:i:1".to_string()),
-        ("dynamic resolution", "dynamic resolution:i:1".to_string()),
-        ("use multimon", "use multimon:i:0".to_string()),
-        ("use multitransport", "use multitransport:i:0".to_string()),
-        ("audiomode", "audiomode:i:2".to_string()),
-        ("audiocapturemode", "audiocapturemode:i:0".to_string()),
-        ("redirectclipboard", "redirectclipboard:i:0".to_string()),
-        ("redirectprinters", "redirectprinters:i:0".to_string()),
-        ("redirectcomports", "redirectcomports:i:0".to_string()),
-        ("redirectsmartcards", "redirectsmartcards:i:0".to_string()),
-        ("redirectdrives", "redirectdrives:i:0".to_string()),
-        ("redirectwebauthn", "redirectwebauthn:i:0".to_string()),
-        ("devicestoredirect", "devicestoredirect:s:".to_string()),
-        ("drivestoredirect", "drivestoredirect:s:".to_string()),
-        ("camerastoredirect", "camerastoredirect:s:".to_string()),
-        (
-            "usbdevicestoredirect",
-            "usbdevicestoredirect:s:".to_string(),
-        ),
-        (
-            "authentication level",
-            "authentication level:i:2".to_string(),
-        ),
-        (
-            "enablecredsspsupport",
-            "enablecredsspsupport:i:1".to_string(),
-        ),
-        (
-            "negotiate security layer",
-            "negotiate security layer:i:1".to_string(),
-        ),
-        (
-            "prompt for credentials on client",
-            "prompt for credentials on client:i:0".to_string(),
-        ),
-        (
-            "disableconnectionsharing",
-            "disableconnectionsharing:i:1".to_string(),
-        ),
-        (
-            "autoreconnection enabled",
-            "autoreconnection enabled:i:0".to_string(),
-        ),
-    ];
-    let drop_keys = [
-        "alternate shell",
-        "shell working directory",
-        "connect to console",
-        "bookmarktype",
-        "use redirection server name",
-        "forcehidpioptimizations",
-        "desktopscalefactor",
-        "devicescalefactor",
-        "hidef color depth",
-        "selectedmonitors",
-        "span monitors",
-    ];
-
-    Some(rewrite_rdp_config(content, &overrides, &drop_keys))
-}
-
-fn rewrite_rdp_config(content: &str, overrides: &[(&str, String)], drop_keys: &[&str]) -> String {
-    let mut output = Vec::new();
-    let mut applied = vec![false; overrides.len()];
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let key = rdp_line_key(trimmed);
-        if drop_keys
-            .iter()
-            .any(|drop_key| key.eq_ignore_ascii_case(drop_key))
-        {
-            continue;
-        }
-
-        if let Some(index) = overrides
-            .iter()
-            .position(|(override_key, _)| key.eq_ignore_ascii_case(override_key))
-        {
-            if !applied[index] {
-                output.push(overrides[index].1.clone());
-                applied[index] = true;
-            }
-            continue;
-        }
-
-        output.push(trimmed.to_string());
-    }
-
-    for (index, (_, line)) in overrides.iter().enumerate() {
-        if !applied[index] {
-            output.push(line.clone());
-        }
-    }
-
-    output.join("\n")
-}
-
-fn rdp_line_key(line: &str) -> &str {
-    line.split_once(':')
-        .map(|(key, _)| key)
-        .unwrap_or(line)
-        .trim()
-}
-
-fn build_mstsc_legacy_graphics_rdp_config(content: &str) -> Option<String> {
-    let full_address = rdp_setting_value(content, "full address")?;
-    let username = rdp_setting_value(content, "username")?;
-
-    if full_address.trim().is_empty() || username.trim().is_empty() {
-        return None;
-    }
-
+    // Mirrors the Swift client's "balanced" profile output on a 1920x1080
+    // logical / Retina display: base 1920x1080 × HiDPI scale 1.5 = 2880x1620,
+    // 24bpp, HiDPI optimizations on.
     let lines = [
-        format!("full address:s:{}", full_address.trim()),
-        format!("username:s:{}", username.trim()),
-        "desktopwidth:i:1280".to_string(),
-        "desktopheight:i:720".to_string(),
-        "screen mode id:i:1".to_string(),
-        "session bpp:i:16".to_string(),
-        "compression:i:1".to_string(),
-        "connection type:i:1".to_string(),
-        "networkautodetect:i:0".to_string(),
-        "bandwidthautodetect:i:0".to_string(),
-        "smart sizing:i:1".to_string(),
-        "dynamic resolution:i:0".to_string(),
-        "use multimon:i:0".to_string(),
-        "use multitransport:i:0".to_string(),
-        "bitmapcachepersistenable:i:0".to_string(),
-        "font smoothing:i:0".to_string(),
-        "disable wallpaper:i:1".to_string(),
-        "disable full window drag:i:1".to_string(),
-        "disable menu anims:i:1".to_string(),
-        "disable themes:i:1".to_string(),
-        "audiomode:i:2".to_string(),
-        "audiocapturemode:i:0".to_string(),
-        "videoplaybackmode:i:0".to_string(),
-        "redirectclipboard:i:0".to_string(),
-        "redirectprinters:i:0".to_string(),
-        "redirectcomports:i:0".to_string(),
-        "redirectsmartcards:i:0".to_string(),
-        "redirectdrives:i:0".to_string(),
-        "devicestoredirect:s:".to_string(),
-        "drivestoredirect:s:".to_string(),
-        "camerastoredirect:s:".to_string(),
-        "usbdevicestoredirect:s:".to_string(),
-        "authentication level:i:2".to_string(),
-        "enablecredsspsupport:i:1".to_string(),
-        "negotiate security layer:i:1".to_string(),
-        "prompt for credentials on client:i:0".to_string(),
-        "disableconnectionsharing:i:1".to_string(),
-        "autoreconnection enabled:i:0".to_string(),
-    ];
-
-    Some(lines.join("\n"))
-}
-
-fn build_mac_microsoft_remote_desktop_rdp_config(content: &str) -> Option<String> {
-    let full_address = rdp_setting_value(content, "full address")?;
-    let username = rdp_setting_value(content, "username")?;
-    let server_address = swift_server_address(full_address.trim());
-
-    if server_address.is_empty() || username.trim().is_empty() {
-        return None;
-    }
-
-    let lines = [
-        format!("full address:s:{server_address}"),
-        format!("username:s:{}", username.trim()),
-        "desktopwidth:i:2880".to_string(),
-        "desktopheight:i:1620".to_string(),
-        "session bpp:i:32".to_string(),
-        "forcehidpioptimizations:i:1".to_string(),
-        "desktopscalefactor:i:150".to_string(),
-        "hidef color depth:i:32".to_string(),
-        "compression:i:1".to_string(),
-        "font smoothing:i:1".to_string(),
-        "disable wallpaper:i:0".to_string(),
-        "disable menu anims:i:1".to_string(),
-        "disable themes:i:0".to_string(),
-        "audiomode:i:0".to_string(),
-        "smart sizing:i:1".to_string(),
-        "screen mode id:i:2".to_string(),
-    ];
-
-    Some(lines.join("\n"))
-}
-
-fn build_swift_compatible_mstsc_rdp_config(content: &str) -> Option<String> {
-    let full_address = rdp_setting_value(content, "full address")?;
-    let username = rdp_setting_value(content, "username")?;
-    let server_address = swift_server_address(full_address.trim());
-
-    if server_address.is_empty() || username.trim().is_empty() {
-        return None;
-    }
-
-    let lines = [
-        format!("full address:s:{server_address}"),
-        format!("username:s:{}", username.trim()),
+        format!("full address:s:{full_address}"),
+        format!("username:s:{username}"),
         "desktopwidth:i:2880".to_string(),
         "desktopheight:i:1620".to_string(),
         "session bpp:i:24".to_string(),
@@ -753,82 +595,6 @@ fn build_swift_compatible_mstsc_rdp_config(content: &str) -> Option<String> {
     ];
 
     Some(lines.join("\n"))
-}
-
-fn build_template_based_mstsc_rdp_config(content: &str) -> Option<String> {
-    let full_address = rdp_setting_value(content, "full address")?;
-    let username = rdp_setting_value(content, "username")?;
-
-    if full_address.trim().is_empty() || username.trim().is_empty() {
-        return None;
-    }
-
-    let template = read_text_file_lossy(&template_rdp_path()).ok()?;
-    Some(apply_rdp_template(
-        &template,
-        full_address.trim(),
-        username.trim(),
-    ))
-}
-
-fn apply_rdp_template(template: &str, full_address: &str, username: &str) -> String {
-    let mut output = Vec::new();
-    let mut saw_full_address = false;
-    let mut saw_username = false;
-
-    for line in template.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let key = trimmed
-            .split_once(':')
-            .map(|(key, _)| key)
-            .unwrap_or(trimmed);
-        if key.eq_ignore_ascii_case("full address") {
-            output.push(format!("full address:s:{full_address}"));
-            saw_full_address = true;
-            continue;
-        }
-        if key.eq_ignore_ascii_case("username") {
-            output.push(format!("username:s:{username}"));
-            saw_username = true;
-            continue;
-        }
-        if should_drop_template_rdp_line(trimmed) {
-            continue;
-        }
-
-        output.push(trimmed.to_string());
-    }
-
-    if !saw_full_address {
-        output.insert(0, format!("full address:s:{full_address}"));
-        saw_full_address = true;
-    }
-    if !saw_username {
-        let insert_at = if saw_full_address { 1 } else { 0 };
-        output.insert(insert_at, format!("username:s:{username}"));
-    }
-
-    output.join("\n")
-}
-
-fn should_drop_template_rdp_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.starts_with("password")
-        || lower.starts_with("gatewayaccesstoken")
-        || lower.starts_with("gatewaycredentialssource")
-        || lower.starts_with("gatewayusername")
-}
-
-fn swift_server_address(full_address: &str) -> &str {
-    full_address
-        .split_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(full_address)
-        .trim()
 }
 
 fn rdp_setting_value<'a>(content: &'a str, wanted_key: &str) -> Option<&'a str> {
@@ -857,6 +623,7 @@ fn has_jumpserver_token_username(content: &str) -> bool {
         .any(|line| line.to_ascii_lowercase().starts_with("username:s:") && line.contains('|'))
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn rdp_credential_targets(address: &str) -> Vec<String> {
     let trimmed = address.trim();
     let host = trimmed
@@ -970,6 +737,7 @@ fn redact_username_line(line: &str) -> String {
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn redact_username_value(value: &str) -> String {
     if let Some((before_token, _token)) = value.split_once('|') {
         format!("{before_token}|<redacted>")
@@ -1014,52 +782,6 @@ fn cleanup_old_rdp_files(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn install_template_rdp(source: &Path, log_path: &Path) -> Result<()> {
-    let content = read_text_file_lossy(source)?;
-    if rdp_setting_value(&content, "full address").is_none() {
-        return Err(LauncherError::Message(format!(
-            "template is not an RDP file with full address: {}",
-            source.display()
-        )));
-    }
-
-    let destination = template_rdp_path();
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&destination, normalize_rdp_newlines(&content).as_bytes())?;
-    append_log(
-        log_path,
-        &format!(
-            "installed MSTSC template from {} to {}",
-            source.display(),
-            destination.display()
-        ),
-    )?;
-    println!("Installed MSTSC template: {}", destination.display());
-    Ok(())
-}
-
-fn clear_template_rdp(log_path: &Path) -> Result<()> {
-    let path = template_rdp_path();
-    if path.exists() {
-        fs::remove_file(&path)?;
-        append_log(
-            log_path,
-            &format!("removed MSTSC template: {}", path.display()),
-        )?;
-        println!("Removed MSTSC template: {}", path.display());
-    } else {
-        append_log(log_path, "MSTSC template already absent")?;
-        println!("MSTSC template is already absent");
-    }
-    Ok(())
-}
-
-fn template_rdp_path() -> PathBuf {
-    app_config_dir().join(TEMPLATE_RDP_FILE_NAME)
 }
 
 fn read_text_file_lossy(path: &Path) -> Result<String> {
@@ -1146,6 +868,12 @@ fn launch_rdp(
         log_cmdkey_disabled(content, log_path);
         Vec::new()
     };
+
+    // On macOS the "Windows App" cannot read Windows Credential Manager, so hand
+    // the token off via the pasteboard instead (cmdkey path is a Windows no-op).
+    if use_cmdkey {
+        prepare_macos_windows_app_credentials(content, token_password, log_path);
+    }
 
     #[cfg(target_os = "windows")]
     if mstsc_override.is_none() && !direct_mstsc {
@@ -1378,6 +1106,76 @@ fn prepare_windows_mstsc_credentials(
     Vec::new()
 }
 
+/// Hand the JumpServer token secret to the macOS "Windows App".
+///
+/// The Windows App can't read Windows Credential Manager the way `cmdkey` does
+/// for mstsc, and `.rdp` files can't carry a usable plaintext password, so on
+/// macOS we copy `token.value` to the system pasteboard (`pbcopy`) right before
+/// launching. The Windows App then prompts for the account password on first
+/// connect and the user pastes it in. (After a successful auth the Windows App
+/// caches the credential in the Keychain for that host.)
+#[cfg(target_os = "macos")]
+fn prepare_macos_windows_app_credentials(
+    content: Option<&str>,
+    token_password: Option<&str>,
+    log_path: &Path,
+) {
+    let Some(content) = content else {
+        return;
+    };
+    if !has_jumpserver_token_username(content) {
+        return;
+    }
+    let Some(password) = token_password.filter(|p| !p.is_empty()) else {
+        let _ = append_log(
+            log_path,
+            "macOS clipboard handoff skipped: jms payload carries no token.value secret; \
+             JumpServer requires password=token.value and the Windows App will need it pasted",
+        );
+        return;
+    };
+
+    let spawned = Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(password.as_bytes());
+            }
+            match child.wait() {
+                Ok(status) => {
+                    let _ = append_log(
+                        log_path,
+                        &format!(
+                            "macOS clipboard: copied token.value to pasteboard \
+                             (pbcopy status={status}); paste it into the Windows App credential prompt"
+                        ),
+                    );
+                    println!(
+                        "Password copied to clipboard — paste it into the \
+                         Windows App credential prompt (Cmd+V)."
+                    );
+                }
+                Err(err) => {
+                    let _ = append_log(log_path, &format!("macOS clipboard pbcopy wait failed: {err}"));
+                }
+            }
+        }
+        Err(err) => {
+            let _ = append_log(log_path, &format!("macOS clipboard pbcopy spawn failed: {err}"));
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prepare_macos_windows_app_credentials(
+    _content: Option<&str>,
+    _token_password: Option<&str>,
+    _log_path: &Path,
+) {
+}
+
 #[cfg(target_os = "windows")]
 fn cleanup_windows_mstsc_credentials(targets: &[String], log_path: &Path) {
     for target in targets {
@@ -1531,19 +1329,49 @@ fn capture_rdp_event_logs(log_path: &Path, label: &str) {
     }
 }
 
-fn register_protocol(
-    log_path: &Path,
-    profile: Option<&str>,
-    direct_mstsc: bool,
-    use_cmdkey: bool,
-) -> Result<()> {
+/// macOS only: register the `.app` bundle this binary lives inside as the
+/// default `jms://` handler. Invoked via `--register-self` from the wrapper
+/// applet's `on run` (i.e. when the user opens the `.app` directly after
+/// dragging it to /Applications), so no manual `lsregister` / plist editing is
+/// needed. On non-macOS this is a no-op that just logs.
+fn register_self_handler(log_path: &Path) -> Result<()> {
+    let exe = env::current_exe()?;
+    // exe = <JMSRdpLauncher.app>/Contents/Resources/jms-rdp-launcher
+    let bundle = exe
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| LauncherError::Message("could not locate parent .app bundle".to_string()))?;
+    append_log(
+        log_path,
+        &format!("--register-self: bundle at {}", bundle.display()),
+    )?;
+
+    #[cfg(target_os = "macos")]
+    {
+        // Register the bundle with LaunchServices, then make it the default
+        // jms:// handler. lsregister -f works without needing HIToolbox.
+        let lsr = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister";
+        match Command::new(lsr).arg("-f").arg(bundle).status() {
+            Ok(status) => {
+                append_log(log_path, &format!("lsregister -f status: {status}"))?;
+            }
+            Err(err) => {
+                append_log(log_path, &format!("lsregister failed: {err}"))?;
+            }
+        }
+        macos_handler::set_default_jms_handler(bundle);
+    }
+
+    println!(
+        "Registered {} as the jms:// handler.",
+        bundle.display()
+    );
+    Ok(())
+}
+
+fn register_protocol(log_path: &Path, direct_mstsc: bool, use_cmdkey: bool) -> Result<()> {
     let exe = env::current_exe()?;
     let mut command_parts = vec![format!("\"{}\"", exe.display())];
-    if let Some(profile) = profile {
-        if profile != DEFAULT_RDP_PROFILE {
-            command_parts.push(format!("--profile {profile}"));
-        }
-    }
     if direct_mstsc {
         command_parts.push("--direct-mstsc".to_string());
     }
@@ -1702,6 +1530,7 @@ fn redact_long(value: &str, max: usize) -> String {
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn redact_event_log(text: &str) -> String {
     text.lines()
         .map(redact_pipe_token_segment)
@@ -1709,6 +1538,7 @@ fn redact_event_log(text: &str) -> String {
         .join("\n")
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn redact_pipe_token_segment(line: &str) -> String {
     let Some(pipe_index) = line.find('|') else {
         return line.to_string();
@@ -2105,7 +1935,7 @@ mod tests {
             }
         }"#;
         let parsed = JsonParser::new(json).parse().unwrap();
-        let launch = extract_rdp_launch(&parsed, DEFAULT_RDP_PROFILE).unwrap();
+        let launch = extract_rdp_launch(&parsed).unwrap();
         assert_eq!(launch.protocol, "rdp");
         assert_eq!(launch.name, "win server");
         assert!(launch.content.contains("full address:s:127.0.0.1:3389"));
@@ -2125,7 +1955,7 @@ mod tests {
         let payload = r#"{"protocol":"rdp","file":{"name":"vm win","content":"full address:s:10.0.0.1:3389\n"}}"#;
         let encoded = "eyJwcm90b2NvbCI6InJkcCIsImZpbGUiOnsibmFtZSI6InZtIHdpbiIsImNvbnRlbnQiOiJmdWxsIGFkZHJlc3M6czoxMC4wLjAuMTozMzg5XG4ifX0=";
         assert_eq!(base64_decode(encoded).unwrap(), payload.as_bytes());
-        let launch = parse_jms_link(&format!("jms://{encoded}"), DEFAULT_RDP_PROFILE).unwrap();
+        let launch = parse_jms_link(&format!("jms://{encoded}")).unwrap();
         assert_eq!(launch.protocol, "rdp");
         assert_eq!(launch.name, "vm win");
     }
@@ -2197,7 +2027,7 @@ mod tests {
     #[test]
     fn parses_jumpserver_filename_config_payload() {
         let encoded = "eyJmaWxlbmFtZSI6Indpbi10ZXN0IiwicHJvdG9jb2wiOiJyZHAiLCJjb25maWciOiJmdWxsIGFkZHJlc3M6czoxMjcuMC4wLjE6MzM4OVxudXNlcm5hbWU6czp0ZXN0dXNlciJ9/";
-        let launch = parse_jms_link(&format!("jms://{encoded}"), DEFAULT_RDP_PROFILE).unwrap();
+        let launch = parse_jms_link(&format!("jms://{encoded}")).unwrap();
         assert_eq!(launch.protocol, "rdp");
         assert_eq!(launch.name, "win-test");
         assert!(!launch.inner_config_base64);
@@ -2208,7 +2038,7 @@ mod tests {
     #[test]
     fn decodes_base64_embedded_rdp_config() {
         let encoded = "eyJmaWxlbmFtZSI6Indpbi10ZXN0IiwicHJvdG9jb2wiOiJyZHAiLCJjb25maWciOiJablZzYkNCaFpHUnlaWE56T25NNk1USXlMakF1TUM0eE9qTXpPRGxjYm5WelpYSnVZVzFsT25NNmVXMXBibWNnIn0=/";
-        let launch = parse_jms_link(&format!("jms://{encoded}"), DEFAULT_RDP_PROFILE).unwrap();
+        let launch = parse_jms_link(&format!("jms://{encoded}")).unwrap();
         assert_eq!(launch.protocol, "rdp");
         assert_eq!(launch.name, "win-test");
         assert!(launch.inner_config_base64);
@@ -2219,235 +2049,61 @@ mod tests {
     }
 
     #[test]
-    fn regenerates_swift_compatible_mstsc_config_for_token_username() {
-        let content = "\
-full address:s:jumpserver.example.com:3389
+    fn regenerates_single_config_for_jumpserver_token_username() {
+        let content = "full address:s:jumpserver.example.com:3389
 username:s:testuser|token
 use multimon:i:0
-session bpp:i:32
+session bpp:i:16
+forcehidpioptimizations:i:1
 authentication level:i:2
-prompt for credentials on client:i:0
-disableconnectionsharing:i:1";
+prompt for credentials on client:i:0";
 
-        let (regenerated, strategy, patches) =
-            normalize_jumpserver_rdp_config(content.to_string(), "swift");
+        let (regenerated, strategy) = normalize_jumpserver_rdp_config(content.to_string());
 
-        assert_eq!(strategy, "swift_compatible_mstsc");
-        assert!(patches.is_empty());
-        assert!(regenerated.contains("full address:s:jumpserver.example.com"));
-        assert!(!regenerated.contains("full address:s:jumpserver.example.com:3389"));
+        assert_eq!(strategy, "regenerated");
+        // full address preserved verbatim, port included (no longer stripped)
+        assert!(regenerated.contains("full address:s:jumpserver.example.com:3389"));
         assert!(regenerated.contains("username:s:testuser|token"));
+        // 24bpp (NOT 32) — 32bpp makes the Windows App negotiate AVC444 which
+        // GNOME Remote Desktop can't serve. Mirrors the Swift "balanced" profile.
+        assert!(regenerated.contains("session bpp:i:24"));
+        assert!(!regenerated.contains("session bpp:i:32"));
+        assert!(regenerated.contains("screen mode id:i:2"));
         assert!(regenerated.contains("desktopwidth:i:2880"));
         assert!(regenerated.contains("desktopheight:i:1620"));
-        assert!(regenerated.contains("session bpp:i:24"));
         assert!(regenerated.contains("forcehidpioptimizations:i:1"));
         assert!(regenerated.contains("desktopscalefactor:i:150"));
         assert!(regenerated.contains("hidef color depth:i:24"));
-        assert!(regenerated.contains("compression:i:1"));
-        assert!(regenerated.contains("font smoothing:i:1"));
-        assert!(!regenerated.contains("authentication level"));
+        // auth-blocking fields are intentionally OMITTED so the client prompts
+        // for the password and accepts the gateway cert
         assert!(!regenerated.contains("prompt for credentials on client"));
-        assert!(!regenerated.contains("disableconnectionsharing"));
-        assert!(!regenerated.contains("enablecredsspsupport"));
-        assert!(!regenerated.contains("use multitransport"));
-        assert!(!regenerated.contains("redirectclipboard"));
-    }
-
-    #[test]
-    fn regenerates_mac_compatible_config_by_default_for_token_username() {
-        let content = "\
-full address:s:jumpserver.example.com:3389
-username:s:testuser|token
-use multimon:i:0
-session bpp:i:32
-audiomode:i:0
-forcehidpioptimizations:i:1
-desktopscalefactor:i:150
-hidef color depth:i:24";
-
-        let (regenerated, strategy, patches) =
-            normalize_jumpserver_rdp_config(content.to_string(), DEFAULT_RDP_PROFILE);
-
-        assert_eq!(strategy, "mac_microsoft_remote_desktop_compatible");
-        assert!(patches.is_empty());
-        assert!(regenerated.contains("full address:s:jumpserver.example.com"));
-        assert!(!regenerated.contains("full address:s:jumpserver.example.com:3389"));
-        assert!(regenerated.contains("username:s:testuser|token"));
-        assert!(regenerated.contains("desktopwidth:i:2880"));
-        assert!(regenerated.contains("desktopheight:i:1620"));
-        assert!(regenerated.contains("screen mode id:i:2"));
-        assert!(regenerated.contains("session bpp:i:32"));
-        assert!(regenerated.contains("forcehidpioptimizations:i:1"));
-        assert!(regenerated.contains("desktopscalefactor:i:150"));
-        assert!(regenerated.contains("hidef color depth:i:32"));
-        assert!(regenerated.contains("audiomode:i:0"));
         assert!(!regenerated.contains("authentication level"));
-        assert!(!regenerated.contains("prompt for credentials on client"));
-        assert!(!regenerated.contains("disableconnectionsharing"));
         assert!(!regenerated.contains("enablecredsspsupport"));
-        assert!(!regenerated.contains("use multitransport"));
-        assert!(!regenerated.contains("redirectclipboard"));
+        assert!(!regenerated.contains("gatewayhostname"));
+        // original input fields are dropped
+        assert!(!regenerated.contains("session bpp:i:16"));
+        assert!(!regenerated.contains("use multimon"));
     }
 
     #[test]
-    fn regenerates_gnome_compatible_config_for_gnome_profile() {
-        let content = "\
-full address:s:jumpserver.example.com:3389
-username:s:testuser|token
-use multimon:i:0
-session bpp:i:32
-audiomode:i:0
-forcehidpioptimizations:i:1
-desktopscalefactor:i:150
-hidef color depth:i:24";
+    fn keeps_config_unchanged_without_jumpserver_token_username() {
+        // A plain .rdp (no `user|token` username) is not regenerated.
+        let content = "full address:s:127.0.0.1:3389\nusername:s:admin\naudiomode:i:0";
 
-        let (regenerated, strategy, patches) =
-            normalize_jumpserver_rdp_config(content.to_string(), "gnome");
+        let (regenerated, strategy) = normalize_jumpserver_rdp_config(content.to_string());
 
-        assert_eq!(strategy, "mstsc_gnome_compatible");
-        assert!(patches.is_empty());
-        assert!(regenerated.contains("full address:s:jumpserver.example.com:3389"));
-        assert!(regenerated.contains("username:s:testuser|token"));
-        assert!(regenerated.contains("desktopwidth:i:1920"));
-        assert!(regenerated.contains("desktopheight:i:1080"));
-        assert!(regenerated.contains("screen mode id:i:1"));
-        assert!(regenerated.contains("session bpp:i:32"));
-        assert!(regenerated.contains("dynamic resolution:i:1"));
-        assert!(regenerated.contains("use multitransport:i:0"));
-        assert!(regenerated.contains("enablecredsspsupport:i:1"));
-        assert!(regenerated.contains("authentication level:i:2"));
-        assert!(regenerated.contains("negotiate security layer:i:1"));
-        assert!(regenerated.contains("redirectdrives:i:0"));
-        assert!(regenerated.contains("redirectwebauthn:i:0"));
-        assert!(regenerated.contains("audiomode:i:2"));
-        assert!(!regenerated.contains("forcehidpioptimizations"));
-        assert!(!regenerated.contains("desktopscalefactor"));
-        assert!(!regenerated.contains("hidef color depth"));
-    }
-
-    #[test]
-    fn template_profile_falls_back_to_mac_config_without_template() {
-        let content = "\
-full address:s:jumpserver.example.com:3389
-username:s:testuser|token
-use multimon:i:0
-session bpp:i:32
-audiomode:i:0";
-
-        let (regenerated, strategy, patches) =
-            normalize_jumpserver_rdp_config(content.to_string(), "template");
-
-        if strategy == "mstsc_saved_template" {
-            return;
-        }
-
-        assert_eq!(strategy, "mac_microsoft_remote_desktop_compatible");
-        assert_eq!(patches, vec!["template_not_installed".to_string()]);
-        assert!(regenerated.contains("full address:s:jumpserver.example.com"));
-        assert!(!regenerated.contains("full address:s:jumpserver.example.com:3389"));
-        assert!(regenerated.contains("session bpp:i:32"));
-        assert!(regenerated.contains("hidef color depth:i:32"));
-        assert!(!regenerated.contains("authentication level"));
-    }
-
-    #[test]
-    fn applies_saved_mstsc_template_without_credentials() {
-        let template = "\
-full address:s:ubuntu.local
-username:s:ubuntu
-session bpp:i:32
-use multitransport:i:0
-password 51:b:010203
-gatewayaccesstoken:s:secret";
-
-        let generated = apply_rdp_template(template, "jumpserver.example.com:3389", "testuser|token");
-
-        assert!(generated.contains("full address:s:jumpserver.example.com:3389"));
-        assert!(generated.contains("username:s:testuser|token"));
-        assert!(generated.contains("session bpp:i:32"));
-        assert!(generated.contains("use multitransport:i:0"));
-        assert!(!generated.contains("ubuntu.local"));
-        assert!(!generated.contains("password 51:b"));
-        assert!(!generated.contains("gatewayaccesstoken"));
-    }
-
-    #[test]
-    fn regenerates_legacy_graphics_config_for_legacy_profile() {
-        let content = "\
-full address:s:jumpserver.example.com:3389
-username:s:testuser|token
-use multimon:i:0
-session bpp:i:32
-audiomode:i:0";
-
-        let (regenerated, strategy, patches) =
-            normalize_jumpserver_rdp_config(content.to_string(), "legacy");
-
-        assert_eq!(strategy, "mstsc_legacy_graphics");
-        assert!(patches.is_empty());
-        assert!(regenerated.contains("full address:s:jumpserver.example.com:3389"));
-        assert!(regenerated.contains("username:s:testuser|token"));
-        assert!(regenerated.contains("desktopwidth:i:1280"));
-        assert!(regenerated.contains("desktopheight:i:720"));
-        assert!(regenerated.contains("screen mode id:i:1"));
-        assert!(regenerated.contains("session bpp:i:16"));
-        assert!(regenerated.contains("audiomode:i:2"));
-        assert!(regenerated.contains("redirectclipboard:i:0"));
-        assert!(regenerated.contains("redirectdrives:i:0"));
-        assert!(regenerated.contains("use multitransport:i:0"));
-        assert!(regenerated.contains("dynamic resolution:i:0"));
-        assert!(regenerated.contains("enablecredsspsupport:i:1"));
-        assert!(regenerated.contains("negotiate security layer:i:1"));
-        assert!(!regenerated.contains("forcehidpioptimizations"));
-        assert!(!regenerated.contains("desktopscalefactor"));
-    }
-
-    #[test]
-    fn raw_profile_keeps_jumpserver_config_unchanged_for_token_username() {
-        let content =
-            "full address:s:jumpserver.example.com:3389\nusername:s:testuser|token\naudiomode:i:0";
-
-        let (regenerated, strategy, patches) =
-            normalize_jumpserver_rdp_config(content.to_string(), "raw");
-
-        assert_eq!(strategy, "raw_jumpserver");
-        assert!(patches.is_empty());
+        assert_eq!(strategy, "raw");
         assert_eq!(regenerated, content);
     }
 
     #[test]
-    fn builds_rdp_credential_targets_with_and_without_port() {
-        assert_eq!(
-            rdp_credential_targets("jumpserver.example.com:3389"),
-            vec![
-                "TERMSRV/jumpserver.example.com".to_string(),
-                "TERMSRV/jumpserver.example.com:3389".to_string()
-            ]
-        );
-        assert_eq!(
-            rdp_credential_targets("jumpserver.example.com"),
-            vec!["TERMSRV/jumpserver.example.com".to_string()]
-        );
-    }
-
-    #[test]
-    fn redacts_standalone_pipe_username_value() {
-        assert_eq!(
-            redact_username_value("testuser|e2ab7862-846f-4e96-bfd9-7b0526f28cb1"),
-            "testuser|<redacted>"
-        );
-    }
-
-    #[test]
-    fn strips_rdp_port_like_swift_connection_info() {
-        let content = "full address:s:jumpserver.example.com:3390\nusername:s:testuser|token";
-        let (regenerated, strategy, patches) =
-            normalize_jumpserver_rdp_config(content.to_string(), "swift");
-
-        assert_eq!(strategy, "swift_compatible_mstsc");
-        assert!(patches.is_empty());
-        assert!(regenerated.contains("full address:s:jumpserver.example.com"));
-        assert!(!regenerated.contains("full address:s:jumpserver.example.com:3390"));
+    fn build_rdp_config_requires_full_address_and_username() {
+        assert!(build_rdp_config("username:s:testuser|token").is_none());
+        assert!(build_rdp_config("full address:s:h:3389").is_none());
+        assert!(build_rdp_config("full address:s:  \nusername:s:  ").is_none());
+        let cfg = build_rdp_config("full address:s:h:3389\nusername:s:u|t").unwrap();
+        assert!(cfg.contains("full address:s:h:3389"));
+        assert!(cfg.contains("username:s:u|t"));
     }
 
     #[test]
