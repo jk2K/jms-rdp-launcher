@@ -42,7 +42,7 @@ struct Cli {
     log: Option<PathBuf>,
     rdp_file: Option<PathBuf>,
     no_wait: bool,
-    direct_mstsc: bool,
+    fullscreen: bool,
     use_cmdkey: bool,
     monitor_seconds: u64,
     help: bool,
@@ -139,7 +139,6 @@ mod macos_handler {
     }
 }
 
-
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
@@ -169,7 +168,7 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
     append_log(log_path, "starting jms-rdp-launcher")?;
 
     if cli.register {
-        register_protocol(log_path, cli.direct_mstsc, cli.use_cmdkey)?;
+        register_protocol(log_path, cli.fullscreen, cli.use_cmdkey)?;
         return Ok(());
     }
 
@@ -195,7 +194,7 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
             None,
             cli.mstsc.as_deref(),
             cli.no_wait,
-            cli.direct_mstsc,
+            cli.fullscreen,
             cli.use_cmdkey,
             cli.monitor_seconds,
             log_path,
@@ -254,7 +253,10 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
             }
         ),
     )?;
-    append_log(log_path, &format!("payload summary: {}", launch.payload_summary))?;
+    append_log(
+        log_path,
+        &format!("payload summary: {}", launch.payload_summary),
+    )?;
 
     if launch.protocol != "rdp" {
         return Err(LauncherError::Message(format!(
@@ -290,7 +292,7 @@ fn run(cli: Cli, log_path: &Path) -> Result<()> {
         launch.password.as_deref(),
         cli.mstsc.as_deref(),
         cli.no_wait,
-        cli.direct_mstsc,
+        cli.fullscreen,
         cli.use_cmdkey,
         cli.monitor_seconds,
         log_path,
@@ -301,6 +303,7 @@ fn parse_cli(args: Vec<String>) -> Result<Cli> {
     let mut cli = Cli {
         monitor_seconds: 30,
         use_cmdkey: true,
+        fullscreen: fullscreen_default_for(env::consts::OS),
         ..Cli::default()
     };
     let mut index = 0;
@@ -314,7 +317,8 @@ fn parse_cli(args: Vec<String>) -> Result<Cli> {
             "--unregister" => cli.unregister = true,
             "--register-self" => cli.register_self = true,
             "--no-wait" => cli.no_wait = true,
-            "--direct-mstsc" => cli.direct_mstsc = true,
+            "--fullscreen" => cli.fullscreen = true,
+            "--windowed" => cli.fullscreen = false,
             "--use-cmdkey" => cli.use_cmdkey = true,
             "--no-cmdkey" => cli.use_cmdkey = false,
             "--monitor-seconds" => {
@@ -371,8 +375,8 @@ fn print_help() {
          Parses a JumpServer jms:// link into a .rdp file and launches the native\n\
          RDP client for the current OS:\n\
            - macOS   -> \"Windows App\" (Microsoft Remote Desktop), via `open`\n\
-           - Windows -> mstsc.exe (via ShellExecute .rdp association by default)\n\
-         There is a single RDP profile; the launch command is chosen by platform.\n\
+           - Windows -> mstsc.exe with the JumpServer-provided .rdp file\n\
+         The RDP config and launch command are chosen by platform.\n\
          \n\
          Usage:\n\
            jms-rdp-launcher [options] \"jms://...\"\n\
@@ -386,7 +390,8 @@ fn print_help() {
            --log <path>         Override log path\n\
            --rdp-file <path>    Launch an existing .rdp file\n\
            --no-wait            Spawn the client and return immediately\n\
-           --direct-mstsc       Windows only: launch mstsc.exe directly instead of ShellExecute .rdp\n\
+           --fullscreen         Windows: pass /f to mstsc.exe (the default)\n\
+           --windowed           Windows: do not force full-screen mode\n\
            --use-cmdkey         Windows only: write user|token_id + token.value to Credential\n\
                                 Manager (default). On macOS the token is copied to the clipboard\n\
                                 so you can paste it into the credential prompt.\n\
@@ -411,6 +416,10 @@ fn parse_jms_link(input: &str) -> Result<RdpLaunch> {
         .map_err(|err| LauncherError::Message(format!("decoded payload is not UTF-8: {err}")))?;
     let json = JsonParser::new(&json_text).parse()?;
     extract_rdp_launch(&json)
+}
+
+fn fullscreen_default_for(platform: &str) -> bool {
+    platform == "windows"
 }
 
 fn extract_rdp_launch(json: &JsonValue) -> Result<RdpLaunch> {
@@ -522,18 +531,41 @@ fn extract_token_secret(object: &BTreeMap<String, JsonValue>) -> Option<String> 
     None
 }
 
-/// Produce the single canonical `.rdp` body for a JumpServer token connection.
-///
-/// There is exactly one profile now. When the payload carries a JumpServer
-/// token username (`user|token_id`) we regenerate a clean, Microsoft-client
-/// (Windows "Windows App" / mstsc) friendly config built around the JumpServer
-/// gateway address and token username. We keep the gateway `full address`
-/// verbatim (port included), fix the colour depth to 32bpp, and turn on the
-/// standard CredSSP/NLA negotiation the JumpServer razor gateway expects.
-///
-/// A plain `.rdp` with no JumpServer token username is left untouched (the
-/// `--rdp-file` path can still launch arbitrary saved files).
+/// Select the RDP document expected by the native client on each platform.
+/// Windows preserves JumpServer's connection settings but supplies the primary
+/// display's physical dimensions so DPI virtualization cannot shrink mstsc.
+/// The macOS Windows App needs the smaller profile generated below.
 fn normalize_jumpserver_rdp_config(content: String) -> (String, &'static str) {
+    normalize_jumpserver_rdp_config_for_platform(content, env::consts::OS)
+}
+
+fn normalize_jumpserver_rdp_config_for_platform(
+    content: String,
+    platform: &str,
+) -> (String, &'static str) {
+    let screen_size = if platform == "windows" {
+        windows_primary_screen_size()
+    } else {
+        None
+    };
+    normalize_jumpserver_rdp_config_for_platform_and_screen(content, platform, screen_size)
+}
+
+fn normalize_jumpserver_rdp_config_for_platform_and_screen(
+    content: String,
+    platform: &str,
+    screen_size: Option<(u32, u32)>,
+) -> (String, &'static str) {
+    if platform == "windows" {
+        if let Some((width, height)) = screen_size {
+            return (
+                apply_windows_desktop_size(&content, width, height),
+                "windows_mstsc_physical_display",
+            );
+        }
+        return (content, "raw_windows_mstsc");
+    }
+
     if has_jumpserver_token_username(&content) {
         if let Some(regenerated) = build_rdp_config(&content) {
             return (regenerated, "regenerated");
@@ -542,11 +574,71 @@ fn normalize_jumpserver_rdp_config(content: String) -> (String, &'static str) {
     (content, "raw")
 }
 
-/// The one and only RDP config generator. Extracts `full address` and
-/// `username` from whatever JumpServer emitted and emits the same minimal
-/// `.rdp` the official JumpServer macOS client (Swift) generates with its
-/// default "balanced" quality profile — because that is the config proven to
-/// connect this Windows App to the Ubuntu 24.04 GNOME Remote Desktop target.
+fn apply_windows_desktop_size(content: &str, width: u32, height: u32) -> String {
+    let replacements = [
+        ("desktopwidth", format!("desktopwidth:i:{width}")),
+        ("desktopheight", format!("desktopheight:i:{height}")),
+    ];
+    let mut replaced = [false; 2];
+    let mut output = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let key = trimmed.split_once(':').map_or(trimmed, |(key, _)| key);
+        if let Some(index) = replacements
+            .iter()
+            .position(|(wanted, _)| key.eq_ignore_ascii_case(wanted))
+        {
+            if !replaced[index] {
+                output.push(replacements[index].1.clone());
+                replaced[index] = true;
+            }
+        } else {
+            output.push(line.to_string());
+        }
+    }
+
+    for (index, (_, setting)) in replacements.into_iter().enumerate() {
+        if !replaced[index] {
+            output.push(setting);
+        }
+    }
+
+    output.join("\n")
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SetProcessDPIAware() -> i32;
+    fn GetSystemMetrics(index: i32) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn windows_primary_screen_size() -> Option<(u32, u32)> {
+    // Without DPI awareness Windows reports logical pixels, such as 1470x819
+    // for a 2940x1638 display at 200% scaling.
+    unsafe {
+        SetProcessDPIAware();
+    }
+    let width = unsafe { GetSystemMetrics(0) };
+    let height = unsafe { GetSystemMetrics(1) };
+    if (200..=8192).contains(&width) && (200..=8192).contains(&height) {
+        Some((width as u32, height as u32))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_primary_screen_size() -> Option<(u32, u32)> {
+    None
+}
+
+/// The macOS RDP config generator. Extracts `full address` and `username` from
+/// whatever JumpServer emitted and emits the same minimal `.rdp` the official
+/// JumpServer macOS client (Swift) generates with its default "balanced"
+/// quality profile.
 ///
 /// Two hard-won specifics, both learned by comparing against the working Swift
 /// client:
@@ -848,7 +940,7 @@ fn launch_rdp(
     token_password: Option<&str>,
     mstsc_override: Option<&Path>,
     no_wait: bool,
-    direct_mstsc: bool,
+    fullscreen: bool,
     use_cmdkey: bool,
     monitor_seconds: u64,
     log_path: &Path,
@@ -860,7 +952,7 @@ fn launch_rdp(
         )));
     }
     #[cfg(not(target_os = "windows"))]
-    let _ = direct_mstsc;
+    let _ = fullscreen;
 
     let installed_credentials = if use_cmdkey {
         prepare_windows_mstsc_credentials(content, token_password, log_path)
@@ -873,40 +965,6 @@ fn launch_rdp(
     // the token off via the pasteboard instead (cmdkey path is a Windows no-op).
     if use_cmdkey {
         prepare_macos_windows_app_credentials(content, token_password, log_path);
-    }
-
-    #[cfg(target_os = "windows")]
-    if mstsc_override.is_none() && !direct_mstsc {
-        append_log(
-            log_path,
-            &format!("launch command: ShellExecuteW open {}", path.display()),
-        )?;
-        log_windows_shell_environment(log_path);
-        if let Err(err) = shell_open_rdp_file(path, log_path) {
-            cleanup_windows_mstsc_credentials(&installed_credentials, log_path);
-            return Err(err);
-        }
-
-        if no_wait {
-            append_log(log_path, "ShellExecuteW returned; --no-wait is active")?;
-            if !installed_credentials.is_empty() {
-                append_log(
-                    log_path,
-                    "cmdkey cleanup deferred because --no-wait is active",
-                )?;
-            }
-        } else {
-            append_log(log_path, "ShellExecuteW returned success")?;
-            if !installed_credentials.is_empty() {
-                append_log(
-                    log_path,
-                    "cmdkey cleanup delayed until after RDP event monitoring",
-                )?;
-            }
-            monitor_rdp_events_after_mstsc_returns(log_path, monitor_seconds);
-            cleanup_windows_mstsc_credentials(&installed_credentials, log_path);
-        }
-        return Ok(());
     }
 
     #[cfg(target_os = "windows")]
@@ -927,7 +985,7 @@ fn launch_rdp(
     #[cfg(target_os = "windows")]
     let mut command = {
         let mut command = Command::new(&program);
-        command.arg(path);
+        command.args(mstsc_arguments(path, fullscreen));
         command
     };
 
@@ -940,7 +998,16 @@ fn launch_rdp(
 
     append_log(
         log_path,
-        &format!("launch command: {} {}", program.display(), path.display()),
+        &format!(
+            "launch command: {} {}{}",
+            program.display(),
+            path.display(),
+            if cfg!(target_os = "windows") && fullscreen {
+                " /f"
+            } else {
+                ""
+            }
+        ),
     )?;
     log_windows_mstsc_environment(log_path, &program);
 
@@ -973,49 +1040,13 @@ fn launch_rdp(
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-#[link(name = "shell32")]
-unsafe extern "system" {
-    fn ShellExecuteW(
-        hwnd: *mut std::ffi::c_void,
-        lp_operation: *const u16,
-        lp_file: *const u16,
-        lp_parameters: *const u16,
-        lp_directory: *const u16,
-        n_show_cmd: i32,
-    ) -> *mut std::ffi::c_void;
-}
-
-#[cfg(target_os = "windows")]
-fn shell_open_rdp_file(path: &Path, log_path: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let operation: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
-    let file: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            operation.as_ptr(),
-            file.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-        )
-    };
-    let code = result as isize;
-    append_log(log_path, &format!("ShellExecuteW result code: {code}"))?;
-    if code <= 32 {
-        return Err(LauncherError::Message(format!(
-            "ShellExecuteW failed with code {code}"
-        )));
+#[cfg(any(target_os = "windows", test))]
+fn mstsc_arguments(path: &Path, fullscreen: bool) -> Vec<std::ffi::OsString> {
+    let mut arguments = vec![path.as_os_str().to_os_string()];
+    if fullscreen {
+        arguments.push("/f".into());
     }
-
-    Ok(())
+    arguments
 }
 
 #[cfg(target_os = "windows")]
@@ -1158,12 +1189,18 @@ fn prepare_macos_windows_app_credentials(
                     );
                 }
                 Err(err) => {
-                    let _ = append_log(log_path, &format!("macOS clipboard pbcopy wait failed: {err}"));
+                    let _ = append_log(
+                        log_path,
+                        &format!("macOS clipboard pbcopy wait failed: {err}"),
+                    );
                 }
             }
         }
         Err(err) => {
-            let _ = append_log(log_path, &format!("macOS clipboard pbcopy spawn failed: {err}"));
+            let _ = append_log(
+                log_path,
+                &format!("macOS clipboard pbcopy spawn failed: {err}"),
+            );
         }
     }
 }
@@ -1222,20 +1259,6 @@ fn native_windows_mstsc_path() -> PathBuf {
         .map(PathBuf::from)
         .find(|path| path.exists())
         .unwrap_or_else(|| PathBuf::from("mstsc.exe"))
-}
-
-#[cfg(target_os = "windows")]
-fn log_windows_shell_environment(log_path: &Path) {
-    let architecture = env::var("PROCESSOR_ARCHITECTURE").unwrap_or_else(|_| "<unset>".to_string());
-    let wow64_architecture =
-        env::var("PROCESSOR_ARCHITEW6432").unwrap_or_else(|_| "<unset>".to_string());
-    let arm64_program_files = env::var("ProgramW6432").unwrap_or_else(|_| "<unset>".to_string());
-    let _ = append_log(
-        log_path,
-        &format!(
-            "windows env: PROCESSOR_ARCHITECTURE={architecture}, PROCESSOR_ARCHITEW6432={wow64_architecture}, ProgramW6432={arm64_program_files}, selected_mstsc=<shell .rdp association>"
-        ),
-    );
 }
 
 #[cfg(target_os = "windows")]
@@ -1362,19 +1385,18 @@ fn register_self_handler(log_path: &Path) -> Result<()> {
         macos_handler::set_default_jms_handler(bundle);
     }
 
-    println!(
-        "Registered {} as the jms:// handler.",
-        bundle.display()
-    );
+    println!("Registered {} as the jms:// handler.", bundle.display());
     Ok(())
 }
 
-fn register_protocol(log_path: &Path, direct_mstsc: bool, use_cmdkey: bool) -> Result<()> {
+fn register_protocol(log_path: &Path, fullscreen: bool, use_cmdkey: bool) -> Result<()> {
     let exe = env::current_exe()?;
     let mut command_parts = vec![format!("\"{}\"", exe.display())];
-    if direct_mstsc {
-        command_parts.push("--direct-mstsc".to_string());
-    }
+    command_parts.push(if fullscreen {
+        "--fullscreen".to_string()
+    } else {
+        "--windowed".to_string()
+    });
     if use_cmdkey {
         command_parts.push("--use-cmdkey".to_string());
     } else {
@@ -1970,11 +1992,7 @@ mod tests {
 
     #[test]
     fn parse_cli_no_cmdkey_disables_credentials() {
-        let cli = parse_cli(vec![
-            "--no-cmdkey".to_string(),
-            "jms://payload".to_string(),
-        ])
-        .unwrap();
+        let cli = parse_cli(vec!["--no-cmdkey".to_string(), "jms://payload".to_string()]).unwrap();
 
         assert!(!cli.use_cmdkey);
     }
@@ -2083,6 +2101,63 @@ prompt for credentials on client:i:0";
         // original input fields are dropped
         assert!(!regenerated.contains("session bpp:i:16"));
         assert!(!regenerated.contains("use multimon"));
+    }
+
+    #[test]
+    fn windows_preserves_jumpserver_rdp_protocol_config() {
+        let content = "full address:s:jumpserver.example.com:3389
+username:s:testuser|token
+authentication level:i:2
+enablecredsspsupport:i:1";
+
+        let (normalized, strategy) = normalize_jumpserver_rdp_config_for_platform_and_screen(
+            content.to_string(),
+            "windows",
+            None,
+        );
+
+        assert_eq!(strategy, "raw_windows_mstsc");
+        assert_eq!(normalized, content);
+    }
+
+    #[test]
+    fn windows_mstsc_launch_forces_fullscreen_by_default() {
+        let path = Path::new(r"C:\Users\test\session.rdp");
+
+        assert!(fullscreen_default_for("windows"));
+        assert_eq!(
+            mstsc_arguments(path, true),
+            vec![path.as_os_str().to_os_string(), "/f".into()]
+        );
+        assert_eq!(
+            mstsc_arguments(path, false),
+            vec![path.as_os_str().to_os_string()]
+        );
+    }
+
+    #[test]
+    fn windows_sets_physical_desktop_size_without_changing_connection_settings() {
+        let content = "full address:s:jumpserver.example.com:3389
+username:s:testuser|token
+desktopwidth:i:1470
+desktopheight:i:819
+authentication level:i:2
+prompt for credentials on client:i:0";
+
+        let (sized, strategy) = normalize_jumpserver_rdp_config_for_platform_and_screen(
+            content.to_string(),
+            "windows",
+            Some((2940, 1638)),
+        );
+
+        assert_eq!(strategy, "windows_mstsc_physical_display");
+        assert!(sized.contains("desktopwidth:i:2940"));
+        assert!(sized.contains("desktopheight:i:1638"));
+        assert!(!sized.contains("desktopwidth:i:1470"));
+        assert!(!sized.contains("desktopheight:i:819"));
+        assert!(sized.contains("authentication level:i:2"));
+        assert!(sized.contains("prompt for credentials on client:i:0"));
+        assert!(sized.contains("username:s:testuser|token"));
     }
 
     #[test]

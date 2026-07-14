@@ -6,8 +6,9 @@
 
 - **macOS** → 通过 `open` 唤起系统里的 **"Windows App"**（原 Microsoft Remote Desktop）
   来连接远程桌面。需要先从 Mac App Store 安装 Windows App。
-- **Windows** → 通过系统自带的 **`mstsc.exe`**（远程桌面连接）来连接远程桌面（默认用
-  `ShellExecute` 打开 `.rdp` 模拟双击；可用 `--direct-mstsc` 改成直接启动 `mstsc.exe`）。
+- **Windows** → 检测主显示器的物理像素尺寸并写入 `.rdp`，再直接运行系统自带的
+  **`mstsc.exe <file.rdp> /f`**。这会避开 150%/200% DPI 缩放把窗口限制在逻辑分辨率的
+  问题。可用 `--windowed` 保留窗口模式。Windows 始终直接运行 mstsc，不使用文件关联。
 
 它接收浏览器传来的 `jms://base64(json)`，解析 JumpServer 的 RDP 信息，生成一份
 `.rdp` 文件写到用户配置目录，然后按上面的方式按系统唤起客户端。
@@ -15,15 +16,22 @@
 兼容 `file.name/file.content` 和 `filename/config` 两种 payload 结构；如果 `config`
 本身还是 base64，程序会继续解码，并把 `\n` 转成真实 RDP 行分隔。
 
-**只有一种 RDP profile。** 当 payload 里的用户名是 JumpServer token 形态
-（`user|token_id`）时，启动器会用网关地址 + token 用户名重新生成一份精简配置
-（见下文「为什么是这份配置」）；普通 `.rdp`（不含 token 用户名，例如 `--rdp-file`
-直接启动已保存的文件）则原样落盘、原样启动。
+`jms://` 只是浏览器唤起启动器的 URL scheme；payload 内的 `protocol` 仍必须是 `rdp`。
+Windows 的 `mstsc.exe` 不直接接收 `rdp://` URL，它接收 `.rdp` 文件，因此启动器会把
+JumpServer 下发的 RDP protocol 配置原样写入文件再交给 mstsc。
+
+RDP 配置按平台处理：
+
+- **Windows**：保留 JumpServer 的原始连接和认证字段，只新增或替换 `desktopwidth`、
+  `desktopheight`。尺寸来自 DPI-aware 的主显示器物理分辨率，例如 Windows 报告的
+  1470×819、192 DPI 会写成 2940×1638。`/f` 只负责启动模式，物理尺寸字段负责正确大小。
+- **macOS**：当用户名是 `user|token_id` 时，生成 Windows App 已验证可用的精简配置。
+- 不含 token 用户名的普通 `.rdp`（例如通过 `--rdp-file` 启动）始终保持原样。
 
 ## 为什么是这份配置（重要，踩过的坑）
 
-重新生成的 `.rdp` **刻意只保留地址、用户名、显示和性能字段**，对照的是官方
-JumpServer macOS 客户端（Swift）默认的 `balanced` 质量配置。两个关键点都是实测得来的：
+macOS 重新生成的 `.rdp` **刻意只保留地址、用户名、显示和性能字段**。Windows 不使用这份
+macOS profile，而是保留 JumpServer 原始配置。两个关键点都是实测得来的：
 
 1. **`session bpp:i:24`，不是 32。** 用 32bpp 时，Microsoft Windows App 会去协商
    AVC444 / H.264 图形编解码；Ubuntu 24.04 的 GNOME Remote Desktop 给不了，于是
@@ -98,7 +106,9 @@ cargo build --release
 ```
 
 写入当前用户的注册表 `HKCU\Software\Classes\jms\shell\open\command`。之后从 JumpServer
-页面点击「本地客户端 / 原生客户端 / RDP」时，浏览器会把 `jms://...` 交给这个程序。
+页面点击「本地客户端 / 原生客户端 / RDP」时，浏览器会把 `jms://...` 交给这个程序，
+程序再把 payload 中 `protocol=rdp` 的 `.rdp` 内容交给 mstsc。升级旧版本后请重新执行
+一次 `--register`，以便注册表命令采用新的 mstsc 默认启动方式。
 
 ### macOS（原生安装：AppleScript applet + .dmg）
 
@@ -166,7 +176,8 @@ secret）。完整原始 `jms://` 会写到同目录 `last_jms_url.txt`，便于
 --log <path>         覆盖日志路径
 --rdp-file <path>    直接启动一个已存在的 .rdp
 --no-wait            启动客户端后立即返回
---direct-mstsc       仅 Windows：直接启动 mstsc.exe 而不是 ShellExecute .rdp
+--fullscreen         仅 Windows：向 mstsc.exe 传 /f，强制全屏（默认行为）
+--windowed           仅 Windows：不强制全屏
 --use-cmdkey         仅 Windows：把 user|token_id + token.value 写进凭据管理器（默认）
 --no-cmdkey          不注入凭据
 --monitor-seconds N  仅 Windows：mstsc 返回后等待 N 秒并抓取 RDP 事件（默认 30）
